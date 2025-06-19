@@ -1,0 +1,126 @@
+Wokwi Coding:
+
+from machine import ADC, Pin, I2C
+from time import sleep
+from lcd_api import LcdApi
+from i2c_lcd import I2cLcd
+import ujson
+import network
+from umqtt.simple import MQTTClient
+import math
+
+# ==== Constants ====
+MQTT_CLIENT_ID = "micropython-gas-sensor"
+MQTT_BROKER = "test.mosquitto.org"
+MQTT_USER = ""
+MQTT_PASSWORD = ""
+MQTT_TOPIC_GAS = "gas-sensor-data"
+MQTT_TOPIC_BUZZER = "gas-sensor/buzzer"
+
+RL_VALUE = 10
+R0 = 9.8
+LPG_CURVE_SLOPE = -0.47
+LPG_CURVE_INTERCEPT = 1.85
+
+# ==== Initialize MQ2 Sensor (GPIO34) ====
+mq2 = ADC(Pin(34))
+mq2.atten(ADC.ATTN_11DB)
+
+# ==== Initialize LCD ====
+i2c = I2C(scl=Pin(22), sda=Pin(21), freq=400000)
+lcd = I2cLcd(i2c, 0x27, 2, 16)
+
+# ==== Initialize Buzzer (GPIO12) ====
+buzzer = Pin(12, Pin.OUT)
+buzzer.value(0)
+
+# ==== Global Variable for Buzzer Mode ====
+buzzer_mode = "AUTO"  # Modes: "AUTO", "ON", "OFF"
+
+# ==== WiFi Connection ====
+print("Connecting to WiFi", end="")
+sta_if = network.WLAN(network.STA_IF)
+sta_if.active(True)
+sta_if.connect('Wokwi-GUEST', '')
+while not sta_if.isconnected():
+    print(".", end="")
+    sleep(0.1)
+print(" Connected!")
+
+# ==== MQTT Callback ====
+def on_message(topic, msg):
+    global buzzer_mode
+    print("Received:", topic, msg)
+    try:
+        mode = msg.decode().upper()
+        if mode in ["ON", "OFF", "AUTO"]:
+            buzzer_mode = mode
+            print("Buzzer mode set to:", buzzer_mode)
+    except Exception as e:
+        print("Error decoding message:", e)
+
+# ==== MQTT Setup ====
+client = MQTTClient(MQTT_CLIENT_ID, MQTT_BROKER, user=MQTT_USER, password=MQTT_PASSWORD)
+client.set_callback(on_message)
+client.connect()
+client.subscribe(MQTT_TOPIC_BUZZER)
+print("MQTT connected & subscribed to buzzer topic")
+
+# ==== Gas PPM Calculation ====
+def calculate_gas_ppm(sensor_voltage):
+    if sensor_voltage <= 0:
+        return 0
+    rs = RL_VALUE * (3.3 - sensor_voltage) / sensor_voltage
+    ratio = rs / R0
+    ppm = math.pow(10, ((math.log10(ratio) - LPG_CURVE_INTERCEPT) / LPG_CURVE_SLOPE))
+    return ppm
+
+# ==== Gas Status ====
+def get_gas_status(ppm):
+    if ppm < 1000:
+        return "Normal"
+    elif 1000 <= ppm < 2000:
+        return "Warning"
+    else:
+        return "Danger"
+
+# ==== Main Loop ====
+while True:
+    try:
+        client.check_msg()  # Check for MQTT messages
+
+        gas_level = mq2.read()
+        voltage = (gas_level / 4095.0) * 3.3
+        gas_ppm = calculate_gas_ppm(voltage)
+        gas_status = get_gas_status(gas_ppm)
+
+        # ==== LCD Display ====
+        lcd.clear()
+        lcd.putstr("Gas Level:\n{:.2f} PPM".format(gas_ppm))
+        sleep(1.5)
+        lcd.clear()
+        lcd.putstr("Status:\n{}".format(gas_status))
+        sleep(1.5)
+
+        # ==== Buzzer Control Logic ====
+        if buzzer_mode == "ON":
+            buzzer.value(1)
+        elif buzzer_mode == "OFF":
+            buzzer.value(0)
+        elif buzzer_mode == "AUTO":
+            buzzer.value(1 if gas_status == "Danger" else 0)
+
+        # ==== MQTT Publish ====
+        gas_message = ujson.dumps(
+            round(gas_ppm, 2),
+        )
+        client.publish(MQTT_TOPIC_GAS, gas_message)
+        print("Published:", gas_message)
+
+        sleep(0.5)
+
+    except Exception as e:
+        print("Error:", e)
+        lcd.clear()
+        lcd.putstr("Error reading\nsensor")
+        sleep(1)
